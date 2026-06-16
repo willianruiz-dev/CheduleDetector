@@ -1,5 +1,16 @@
-# Subproyectos con su propio repo
-CedulaColombianaReader/
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
 
-# Archivos temporales
-*.md
+# Entornos virtuales
+venv/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
