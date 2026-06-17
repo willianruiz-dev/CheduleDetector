@@ -132,44 +132,49 @@ class RegionDetector:
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         blurred = cv2.GaussianBlur(gray, (5, 5), 0)
 
-        # Detectar bordes
-        edges = cv2.Canny(blurred, 30, 100)
-
-        # Dilatar para conectar bordes cercanos
-        kernel = np.ones((5, 5), np.uint8)
-        dilated = cv2.dilate(edges, kernel, iterations=2)
-
-        # Encontrar contornos
-        contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        if not contours:
-            return None
-
-        # Buscar el contorno más grande que sea aproximadamente rectangular
         best_rect = None
         best_area = 0
-        img_area = w * h
 
-        for cnt in contours:
-            area = cv2.contourArea(cnt)
-            # Debe ocupar entre 25% y 95% de la imagen
-            if area < img_area * 0.25 or area > img_area * 0.95:
+        # Probar varios umbrales de Canny para mejor detección
+        for low_t in [30, 50, 80]:
+            edges = cv2.Canny(blurred, low_t, low_t * 3)
+
+            # Dilatar para conectar bordes cercanos
+            kernel = np.ones((7, 7), np.uint8)
+            dilated = cv2.dilate(edges, kernel, iterations=3)
+
+            # Encontrar contornos
+            contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+            if not contours:
                 continue
 
-            # Aproximar a polígono
-            peri = cv2.arcLength(cnt, True)
-            approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
+            img_area = w * h
 
-            # Debe tener 4 esquinas (rectangular)
-            if len(approx) == 4 and area > best_area:
-                best_area = area
-                # Obtener bounding box
-                x, y, rw, rh = cv2.boundingRect(approx)
+            for cnt in contours:
+                area = cv2.contourArea(cnt)
+                # Debe ocupar entre 15% y 95% de la imagen
+                if area < img_area * 0.15 or area > img_area * 0.95:
+                    continue
 
-                # Verificar proporción razonable (~1.4-1.8 para cédula)
-                ratio = rw / rh if rh > 0 else 0
-                if 1.2 <= ratio <= 2.0:
-                    best_rect = (x, y, rw, rh)
+                # Aproximar a polígono
+                peri = cv2.arcLength(cnt, True)
+                for eps in [0.02, 0.05, 0.08]:
+                    approx = cv2.approxPolyDP(cnt, eps * peri, True)
+
+                    # Debe tener 4 esquinas (rectangular)
+                    if len(approx) >= 4 and area > best_area:
+                        # Obtener bounding box
+                        x, y, rw, rh = cv2.boundingRect(approx)
+
+                        # Verificar proporción razonable (1.2-2.0 para cédula)
+                        ratio = rw / rh if rh > 0 else 0
+                        if 1.2 <= ratio <= 2.2:
+                            best_area = area
+                            best_rect = (x, y, rw, rh)
+
+            if best_rect is not None:
+                break
 
         return best_rect
 
@@ -231,75 +236,75 @@ class RegionDetector:
         """
         regions = {}
 
-        # ── Foto: 5%-35% ancho, 5%-40% alto ──
+        # ── Foto: 5%-30% ancho, 5%-55% alto ──
         regions[RegionName.FOTO] = (
-            int(w * 0.05), int(h * 0.05),
-            int(w * 0.30), int(h * 0.35),
+            int(w * 0.04), int(h * 0.04),
+            int(w * 0.26), int(h * 0.52),
         )
 
         # ── Número de cédula: esquina superior derecha ──
         regions[RegionName.NUMERO_CEDULA] = (
-            int(w * 0.35), int(h * 0.02),
-            int(w * 0.60), int(h * 0.08),
+            int(w * 0.32), int(h * 0.02),
+            int(w * 0.64), int(h * 0.07),
         )
 
-        # ── Apellidos y nombres: centro-derecha ──
+        # ── Apellidos y nombres: centro-derecha (el texto más grande) ──
         regions[RegionName.APELLIDOS_NOMBRES] = (
-            int(w * 0.35), int(h * 0.10),
-            int(w * 0.60), int(h * 0.12),
+            int(w * 0.32), int(h * 0.10),
+            int(w * 0.64), int(h * 0.14),
         )
 
         # ── Fecha de nacimiento ──
         regions[RegionName.FECHA_NACIMIENTO] = (
-            int(w * 0.35), int(h * 0.22),
-            int(w * 0.35), int(h * 0.06),
+            int(w * 0.32), int(h * 0.24),
+            int(w * 0.30), int(h * 0.06),
         )
 
         # ── Lugar de nacimiento ──
         regions[RegionName.LUGAR_NACIMIENTO] = (
-            int(w * 0.35), int(h * 0.28),
-            int(w * 0.60), int(h * 0.06),
+            int(w * 0.32), int(h * 0.30),
+            int(w * 0.64), int(h * 0.06),
         )
 
         # ── Estatura ──
         regions[RegionName.ESTATURA] = (
-            int(w * 0.35), int(h * 0.36),
-            int(w * 0.15), int(h * 0.05),
+            int(w * 0.32), int(h * 0.38),
+            int(w * 0.14), int(h * 0.05),
         )
 
         # ── Grupo sanguíneo ──
         regions[RegionName.GRUPO_SANGUINEO] = (
-            int(w * 0.52), int(h * 0.36),
+            int(w * 0.48), int(h * 0.38),
             int(w * 0.10), int(h * 0.05),
         )
 
         # ── Sexo ──
         regions[RegionName.SEXO] = (
-            int(w * 0.65), int(h * 0.36),
+            int(w * 0.62), int(h * 0.38),
             int(w * 0.10), int(h * 0.05),
         )
 
         # ── Fecha de expedición ──
         regions[RegionName.FECHA_EXPEDICION] = (
-            int(w * 0.35), int(h * 0.44),
+            int(w * 0.32), int(h * 0.46),
             int(w * 0.35), int(h * 0.06),
         )
 
         # ── Firma: inferior derecha ──
         regions[RegionName.FIRMA] = (
-            int(w * 0.55), int(h * 0.52),
-            int(w * 0.40), int(h * 0.13),
+            int(w * 0.52), int(h * 0.56),
+            int(w * 0.44), int(h * 0.14),
         )
 
         # ── Huella: inferior izquierda ──
         regions[RegionName.HUELLA] = (
-            int(w * 0.02), int(h * 0.45),
-            int(w * 0.20), int(h * 0.25),
+            int(w * 0.02), int(h * 0.58),
+            int(w * 0.24), int(h * 0.25),
         )
 
         # ── PDF417: franja inferior ──
         regions[RegionName.PDF417] = (
-            int(w * 0.05), int(h * 0.78),
+            int(w * 0.05), int(h * 0.80),
             int(w * 0.90), int(h * 0.15),
         )
 

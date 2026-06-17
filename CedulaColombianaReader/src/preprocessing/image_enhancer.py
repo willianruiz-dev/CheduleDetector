@@ -55,12 +55,16 @@ class ImageEnhancer:
         # 1. Reducir ruido preservando bordes (importante para OCR)
         gray = self._denoise(gray)
 
-        # 2. Aplicar CLAHE para mejorar contraste local
+        # 2. Suprimir líneas finas de seguridad (guilloché)
+        #    Las líneas decorativas son más finas que el texto
+        gray = self._suppress_guilloche(gray)
+
+        # 3. Aplicar CLAHE para mejorar contraste local
         #    Crucial para cédulas amarillas donde el texto negro
         #    puede tener poco contraste con el fondo
         gray = self._clahe.apply(gray)
 
-        # 3. Nitidez suave para resaltar caracteres
+        # 4. Nitidez suave para resaltar caracteres
         gray = self._sharpen(gray)
 
         return gray
@@ -89,3 +93,17 @@ class ImageEnhancer:
                            [-1,  9, -1],
                            [-1, -1, -1]])
         return cv2.filter2D(gray, -1, kernel)
+
+    def _suppress_guilloche(self, gray: np.ndarray) -> np.ndarray:
+        """
+        Suprime líneas finas de seguridad (guilloché) preservando texto.
+
+        Las líneas guilloché son más finas (~1-2px) que el texto (~3-6px).
+        Un opening morfológico con kernel de 2px elimina las líneas
+        decorativas mientras mantiene los caracteres legibles.
+        """
+        # Kernel pequeño: elimina líneas de 1-2px pero preserva texto más grueso
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        # Opening = erosion + dilation: elimina detalles finos
+        opened = cv2.morphologyEx(gray, cv2.MORPH_OPEN, kernel)
+        return opened

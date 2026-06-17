@@ -47,8 +47,10 @@ class RegexPatterns:
 
     # ── Grupo sanguíneo ────────────────────────────────────────
     # Formato: O+, A-, AB+, B-
+    # Nota: \b no funciona después de + o - porque no son word chars,
+    # así que usamos \b solo al inicio y aceptamos cualquier terminación
     GRUPO_SANGRE_PATTERN = re.compile(
-        r"\b([ABO]{1,2})\s*([+-])\b",
+        r"\b([ABO]{1,2})\s*([+-])",
         re.IGNORECASE,
     )
 
@@ -179,7 +181,7 @@ class RegexPatterns:
             if depto in text_upper:
                 # Buscar ciudad antes del departamento
                 idx = text_upper.find(depto)
-                prefix = text_upper[:idx].strip().rstrip(",").rstrip("-")
+                prefix = text_upper[:idx].strip().rstrip(",").rstrip("-").strip("(").strip()
                 if prefix:
                     # Validar que el prefijo sea una ciudad conocida
                     for ciudad in cls.CIUDADES_COLOMBIA:

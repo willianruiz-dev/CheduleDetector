@@ -74,6 +74,69 @@ class TextRecognizer:
         else:
             return "", 0.0
 
+    def recognize_full_page(
+        self, image: np.ndarray
+    ) -> list:
+        """
+        Reconoce TODO el texto en una imagen completa, devolviendo
+        cada bloque con su posición y confianza.
+
+        Args:
+            image: Imagen BGR completa.
+
+        Returns:
+            Lista de dicts: [{"text": str, "conf": float, "x": int, "y": int, "w": int, "h": int}, ...]
+        """
+        if self._easyocr_reader is not None:
+            return self._recognize_full_easyocr(image)
+        elif self._paddleocr_reader is not None:
+            return self._recognize_full_paddleocr(image)
+        else:
+            return []
+
+    def _recognize_full_easyocr(self, image: np.ndarray) -> list:
+        """EasyOCR en página completa con posiciones."""
+        results = self._easyocr_reader.readtext(image)
+        blocks = []
+        for bbox, text, conf in results:
+            x = int(bbox[0][0])
+            y = int(bbox[0][1])
+            w = int(bbox[2][0] - bbox[0][0])
+            h = int(bbox[2][1] - bbox[0][1])
+            blocks.append({"text": text, "conf": float(conf), "x": x, "y": y, "w": w, "h": h})
+        return blocks
+
+    def _recognize_full_paddleocr(self, image: np.ndarray) -> list:
+        """PaddleOCR en página completa con posiciones."""
+        try:
+            results = self._paddleocr_reader.ocr(image, cls=True)
+        except (TypeError, ValueError):
+            results = self._paddleocr_reader.ocr(image)
+
+        if not results or not results[0]:
+            return []
+
+        blocks = []
+        for line in results[0]:
+            if isinstance(line, dict):
+                text = line.get("text", "")
+                conf = line.get("confidence", 0.0)
+                bbox = line.get("bbox", [[0,0],[0,0],[0,0],[0,0]])
+                x, y = int(bbox[0][0]), int(bbox[0][1])
+                w = int(bbox[2][0] - bbox[0][0])
+                h = int(bbox[2][1] - bbox[0][1])
+            elif isinstance(line, (list, tuple)) and len(line) >= 2:
+                bbox = line[0]
+                x, y = int(bbox[0][0]), int(bbox[0][1])
+                w = int(bbox[2][0] - bbox[0][0])
+                h = int(bbox[2][1] - bbox[0][1])
+                text = line[1][0] if isinstance(line[1], (list, tuple)) else str(line[1])
+                conf = line[1][1] if isinstance(line[1], (list, tuple)) and len(line[1]) >= 2 else 0.0
+            else:
+                continue
+            blocks.append({"text": text, "conf": float(conf), "x": x, "y": y, "w": w, "h": h})
+        return blocks
+
     def recognize_regions(
         self, regions: dict
     ) -> dict:
@@ -117,12 +180,16 @@ class TextRecognizer:
         """Intenta inicializar PaddleOCR."""
         try:
             from paddleocr import PaddleOCR
-            self._paddleocr_reader = PaddleOCR(
-                use_angle_cls=True,
-                lang="es",
-                use_gpu=self.use_gpu,
-                show_log=False,
-            )
+            # Soporte tanto para PaddleOCR 2.x como 3.x
+            try:
+                self._paddleocr_reader = PaddleOCR(
+                    use_angle_cls=True,
+                    lang="es",
+                    use_gpu=self.use_gpu,
+                    show_log=False,
+                )
+            except (TypeError, ValueError):
+                self._paddleocr_reader = PaddleOCR(lang="es")
             print("[OCR] Backend: PaddleOCR (español)")
             return True
         except ImportError:
@@ -183,7 +250,10 @@ class TextRecognizer:
         self, image: np.ndarray
     ) -> Tuple[str, float]:
         """Reconoce texto con PaddleOCR."""
-        results = self._paddleocr_reader.ocr(image, cls=True)
+        try:
+            results = self._paddleocr_reader.ocr(image, cls=True)
+        except (TypeError, ValueError):
+            results = self._paddleocr_reader.ocr(image)
 
         if not results or not results[0]:
             return "", 0.0
@@ -191,10 +261,18 @@ class TextRecognizer:
         texts = []
         confidences = []
         for line in results[0]:
-            text = line[1][0]
-            conf = line[1][1]
+            # PaddleOCR 2.x: line = [bbox, (text, confidence)]
+            # PaddleOCR 3.x: line = {"text": ..., "confidence": ...} or similar
+            if isinstance(line, dict):
+                text = line.get("text", "")
+                conf = line.get("confidence", 0.0)
+            elif isinstance(line, (list, tuple)) and len(line) >= 2:
+                text = line[1][0] if isinstance(line[1], (list, tuple)) else str(line[1])
+                conf = line[1][1] if isinstance(line[1], (list, tuple)) and len(line[1]) >= 2 else 0.0
+            else:
+                continue
             texts.append(text)
-            confidences.append(conf)
+            confidences.append(float(conf))
 
         full_text = " ".join(texts)
         avg_confidence = float(np.mean(confidences)) if confidences else 0.0

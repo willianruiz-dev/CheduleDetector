@@ -37,13 +37,17 @@ class BarcodeDecoder:
         """
         results = []
 
-        # Intentar con pyzbar
+        # Intentar con pyzbar en la imagen original
         if self._pyzbar_available:
             results = self._decode_with_pyzbar(image)
 
-        # Si no encontró nada, buscar específicamente en el tercio inferior
+        # Si falla, probar en el tercio inferior con mejoras
         if not results:
             results = self._decode_lower_third(image)
+
+        # Si aún falla, probar con binarización adaptativa
+        if not results:
+            results = self._decode_with_preprocess(image)
 
         return results
 
@@ -114,6 +118,60 @@ class BarcodeDecoder:
             return results
 
         return []
+
+    def _decode_with_preprocess(self, image: np.ndarray) -> List[dict]:
+        """
+        Intenta decodificar PDF417 aplicando múltiples preprocesamientos
+        en la región inferior de la imagen.
+        """
+        if not self._pyzbar_available:
+            return []
+
+        h, w = image.shape[:2]
+        lower = image[int(h * 0.55):, :]  # Mitad inferior
+
+        if len(lower.shape) == 3:
+            gray = cv2.cvtColor(lower, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = lower.copy()
+
+        prep_methods = [
+            ("original", gray),
+            ("clahe", self._apply_clahe(gray)),
+            ("binary_otsu", cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]),
+            ("binary_adaptive", cv2.adaptiveThreshold(gray, 255,
+                cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 5)),
+            ("inverted_otsu", cv2.bitwise_not(
+                cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1])),
+            ("sharpen", self._sharpen_barcode(gray)),
+        ]
+
+        for name, prep_img in prep_methods:
+            results = self._decode_with_pyzbar(prep_img)
+            if results:
+                print(f"[Barcode] PDF417 decodificado con preprocesamiento: {name}")
+                for r in results:
+                    x, y, rw, rh = r["rect"]
+                    r["rect"] = (x, y + int(h * 0.55), rw, rh)
+                return results
+
+        return []
+
+    @staticmethod
+    def _apply_clahe(gray: np.ndarray) -> np.ndarray:
+        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+        return clahe.apply(gray)
+
+    @staticmethod
+    def _sharpen_barcode(gray: np.ndarray) -> np.ndarray:
+        """Enfoca bordes horizontales para resaltar las barras del PDF417."""
+        kernel = np.array([[-1, -1, -1],
+                           [-1,  9, -1],
+                           [-1, -1, -1]])
+        sharp = cv2.filter2D(gray, -1, kernel)
+        # Binarizar después de enfocar
+        _, sharp = cv2.threshold(sharp, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        return sharp
 
     def detect_barcode_region(
         self, image: np.ndarray

@@ -177,3 +177,53 @@ class BarcodeParser:
             # Guardar versión con puntos y sin puntos
             result["numero_cedula_raw"] = cedula
             result["numero_cedula_sin_puntos"] = cedula.replace(".", "")
+
+    @classmethod
+    def parse_text_line(cls, text: str) -> Dict[str, Optional[str]]:
+        """
+        Parsea la línea de texto humano impresa debajo del PDF417.
+        Formato típico: P-XXXXXXX-XXXXXXXX-M-XXXXXXXXXX-YYYYMMDD
+        o similar, con campos separados por guiones.
+        """
+        result: Dict[str, Optional[str]] = {}
+
+        # Unir múltiples líneas si hay espacios
+        text = text.strip()
+        text_lower = text.lower()
+
+        # Intentar detectar sexo (M o F entre guiones o aislado)
+        sexo_match = re.search(r"(?:^|[-\s])([MF])(?:[-\s]|$)", text, re.IGNORECASE)
+        if sexo_match:
+            result["sexo"] = sexo_match.group(1).upper()
+
+        # Intentar detectar fecha en formato YYYYMMDD (validar rangos)
+        fecha_match = re.search(r"\b(19|20)(\d{2})(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])\b", text)
+        if fecha_match:
+            y1, y2, m, d = fecha_match.groups()
+            result["fecha_expedicion"] = f"{y1}{y2}-{m}-{d}"
+
+        # Buscar número de cédula en el texto del PDF417.
+        # Formato típico: P-XXXXXXX-XXXXXXXX-M-XXXXXXXXXX-YYYYMMDD
+        # donde el penúltimo campo (índice -2) es la cédula en 10 dígitos.
+        # Si no se detecta por guiones, se busca cualquier número de 8-10 dígitos.
+        parts = [p.strip() for p in text.split("-")]
+        cedula_candidate = None
+
+        if len(parts) >= 2:
+            # El penúltimo campo suele ser la cédula (justo antes de la fecha)
+            penultimo = parts[-2]
+            if penultimo.isdigit() and 7 <= len(penultimo) <= 10:
+                cedula_candidate = penultimo
+
+        if not cedula_candidate:
+            # Fallback: buscar cualquier número de 8-10 dígitos
+            nuip_matches = re.findall(r"\b(\d{8,10})\b", text)
+            if nuip_matches:
+                cedula_candidate = max(nuip_matches, key=len)
+
+        if cedula_candidate:
+            # Quitar ceros a la izquierda (cédula antigua viene como 0070435855)
+            # Para cédulas nuevas (NUIP de 10 dígitos) no hay ceros al inicio.
+            result["numero_cedula"] = cedula_candidate.lstrip("0") or "0"
+
+        return result

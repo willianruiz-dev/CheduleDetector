@@ -25,9 +25,9 @@ class PerspectiveCorrector:
 
     def __init__(
         self,
-        canny_low: int = 50,
-        canny_high: int = 150,
-        min_contour_area: float = 0.3,  # 30% del área de la imagen
+        canny_low: int = 30,
+        canny_high: int = 90,
+        min_contour_area: float = 0.15,  # 15% del área de la imagen
     ):
         self.canny_low = canny_low
         self.canny_high = canny_high
