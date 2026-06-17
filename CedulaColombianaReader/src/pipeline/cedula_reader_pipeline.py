@@ -108,9 +108,11 @@ class CedulaReaderPipeline:
         print(f"[Pipeline] Lado detectado por orientación: {'REVERSO' if es_reverso else 'ANVERSO'}")
 
         # ── 0c. Auto-rotar si está vertical ────────────────────
+        # Anverso: la foto se toma en vertical pero el texto corre
+        # horizontalmente -> ROTATE_90_COUNTERCLOCKWISE alinea el texto.
         if h_img > w_img:
-            print("[Pipeline] Imagen vertical → rotando 90°")
-            image = cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE)
+            print("[Pipeline] Imagen vertical -> rotando 90 deg CCW")
+            image = cv2.rotate(image, cv2.ROTATE_90_COUNTERCLOCKWISE)
 
         # ── 1. Preprocesamiento ────────────────────────────────
         # 1a. Corrección de perspectiva (solo anverso)
@@ -158,13 +160,33 @@ class CedulaReaderPipeline:
             print(f"  ({b['x']:4d},{b['y']:4d}) {b['w']:4d}x{b['h']:4d} "
                   f"| conf={b['conf']:.2f} | '{b['text']}'")
 
-        # ── 5. Clasificar por posición ────────────────────────
-        if es_reverso:
-            from src.extraction.position_classifier import classify_blocks_reverso
-            campos_por_posicion = classify_blocks_reverso(all_blocks, w_img, h_img)
-        else:
-            from src.extraction.position_classifier import classify_blocks
-            campos_por_posicion = classify_blocks(all_blocks, w_img, h_img)
+        # ── 5. Clasificar por posicion ────────────────────────
+        # Probar los 4 clasificadores y elegir el que devuelva mas campos.
+        # No hay deteccion previa de formato: cada clasificador sabe a que
+        # zonas prestar atencion.
+        from src.extraction.position_classifier import (
+            classify_blocks, classify_blocks_reverso,
+            classify_blocks_nueva, classify_blocks_reverso_nueva,
+        )
+
+        candidates = [
+            ("ANVERSO CLASICO", classify_blocks(all_blocks, w_img, h_img), False),
+            ("REVERSO CLASICO", classify_blocks_reverso(all_blocks, w_img, h_img), True),
+            ("ANVERSO NUEVO", classify_blocks_nueva(all_blocks, w_img, h_img), False),
+            ("REVERSO NUEVO", classify_blocks_reverso_nueva(all_blocks, w_img, h_img), True),
+        ]
+
+        # Contar campos no vacios (mrz_raw del reverso nuevo cuenta como +3)
+        def score(res):
+            s = sum(1 for v in res.values() if v)
+            if res.get("mrz_raw"):
+                s += 3
+            return s
+
+        best_name, campos_por_posicion, es_reverso = max(candidates, key=lambda c: score(c[1]))
+
+        print(f"[Pipeline] Clasificador elegido: {best_name} "
+              f"({score(campos_por_posicion)} campos)")
 
         print("[Pipeline] Campos clasificados por posición:")
         for campo, valor in campos_por_posicion.items():
@@ -195,7 +217,7 @@ class CedulaReaderPipeline:
                 if datos_pdf417:
                     print(f"[Pipeline] Datos extraídos del texto: {datos_pdf417}")
 
-        # Número de cédula
+        # Numero de cedula
         if campos_por_posicion["numero_cedula"]:
             num = patterns.extract_cedula(campos_por_posicion["numero_cedula"])
             cedula.numero_cedula = num
@@ -256,17 +278,21 @@ class CedulaReaderPipeline:
 
         cedula.raw_text = " | ".join(raw_parts) if raw_parts else ""
 
+        # ── 6b. MRZ (cédula digital nueva) ──────────────────
+        if campos_por_posicion.get("mrz_raw"):
+            cedula.raw_text += f" || MRZ: {campos_por_posicion['mrz_raw']}"
+
         # ── 7. Validación cruzada OCR vs PDF417 ─────────────
         if datos_pdf417:
             print("[Pipeline] Validando OCR vs PDF417...")
             self.cross_validator.apply_validation(cedula, datos_pdf417)
 
             if cedula.tiene_discrepancias:
-                print(f"[Pipeline] ⚠ {len(cedula.discrepancias_pdf417)} discrepancias:")
+                print(f"[Pipeline] [!] {len(cedula.discrepancias_pdf417)} discrepancias:")
                 for d in cedula.discrepancias_pdf417:
                     print(f"    - {d}")
             else:
-                print("[Pipeline] ✅ OCR y PDF417 coinciden.")
+                print("[Pipeline] [OK] OCR y PDF417 coinciden.")
 
         # ── 8. Calcular confianza ───────────────────────────
         campos_encontrados = sum(1 for v in [
@@ -280,12 +306,12 @@ class CedulaReaderPipeline:
 
         if cedula.confidence_score < self.confidence_threshold:
             print(
-                f"[Pipeline] ⚠ Confianza baja ({cedula.confidence_score:.2f}). "
+                f"[Pipeline] [!] Confianza baja ({cedula.confidence_score:.2f}). "
                 f"Umbral: {self.confidence_threshold}"
             )
 
         print(
-            f"[Pipeline] ✅ Procesamiento completado en "
+            f"[Pipeline] [OK] Procesamiento completado en "
             f"{cedula.processing_time_ms}ms. "
             f"Confianza: {cedula.confidence_score:.2f}"
         )

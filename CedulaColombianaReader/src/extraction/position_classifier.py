@@ -1,87 +1,231 @@
 """
 Clasificador de bloques OCR por posición en la cédula colombiana.
 
-En vez de regiones fijas, clasifica cada texto detectado según
-su ubicación (x%, y%) relativa en la imagen.
+Basado en zonas proporcionales exactas definidas desde el plano
+de la cédula (anverso y reverso), con soporte para CC, CE y TI.
+
+Cada zona se define como [ymin, xmin, ymax, xmax] en rango 0-1.
+Un bloque se asigna a una zona si su centro cae dentro de ella.
 """
-from typing import List, Dict, Tuple, Optional
-from dataclasses import dataclass
+from typing import List, Dict, Optional
 import re
 
-# Etiquetas fijas de la cédula que NO son datos del titular
-_LABELS = [
-    "APELLIDOS", "NOMBRES", "IDENTIFICACION PERSONAL",
-    "REPUBLICA DE COLOMBIA", "CEDULA DE CIUDADANIA",
-    "FIRMA", "FIRMA DEL TITULAR", "HUELLA", "HUELLA DACTILAR",
-    "ESTATURA", "G.S.", "GRUPO SANGUINEO", "SEXO",
-    "FECHA DE NACIMIENTO", "FECHA NACIMIENTO",
-    "LUGAR DE NACIMIENTO",
-    "FECHA DE EXPEDICION", "FECHA EXPEDICION",
-    "NACIONALIDAD", "NACIONAL",
-    "NO. DE CEDULA", "NUMERO DE CEDULA",
-    "REGISTRADURIA NACIONAL", "REGISTRADURIA",
-    "REPUBLICA DE COLOMBLA",  # variante OCR común
-    "IDENTIFICACION PERSONAI",
+
+# ═══════════════════════════════════════════════════════════════
+# ZONAS DEL ANVERSO (frente)
+# ═══════════════════════════════════════════════════════════════
+# Layout real tras ROTATE_90_COUNTERCLOCKWISE → 1600x1200:
+#
+#  ┌──────────────────────────────────────────────────┐
+#  │  REPUBLICA DE COLOMBIA                           │
+#  │  IDENTIFICACION PERSONAL       CEDULA DE         │
+#  │                                CIUDADANIA        │
+#  │  NUMERO: [=== 70435855 ===]       ┌──────────┐   │
+#  │  APELLIDOS: [= HUIZ ZAPATA =]     │          │   │
+#  │  NOMBRES: [= WILLIAN DARIO =]     │  [FOTO]  │   │
+#  │                                   │          │   │
+#  │  ┌──────────────┐                 └──────────┘   │
+#  │  │   [FIRMA]    │                                │
+#  │  └──────────────┘                                │
+#  └──────────────────────────────────────────────────┘
+#
+# Coordenadas en formato [ymin, xmin, ymax, xmax] (0-1)
+# Valores medidos: cedula cy≈0.38, apellidos cy≈0.48, nombres cy≈0.60
+
+ANVERSO_ZONES: Dict[str, list] = {
+    # Número de cédula: arriba a la izquierda
+    "numero_cedula":      [0.30, 0.05, 0.44, 0.42],
+
+    # Apellidos: debajo del número (label + valor)
+    "apellidos":          [0.42, 0.05, 0.56, 0.42],
+
+    # Nombres: debajo de apellidos (label + valor)
+    "nombres":            [0.55, 0.05, 0.70, 0.42],
+
+    # Firma: abajo a la izquierda
+    "firma":              [0.68, 0.05, 0.88, 0.45],
+}
+
+
+# ═══════════════════════════════════════════════════════════════
+# ZONAS DEL REVERSO (atrás)
+# ═══════════════════════════════════════════════════════════════
+# Layout real (cc_reverso.jpg → 1600x1200):
+#
+#  ┌──────────────────────────────────────────────────┐
+#  │  ┌──────────┐  FECHA DE NACIMIENTO  27-NOV-1983 │
+#  │  │          │  CAÑASGORDAS                       │
+#  │  │ [HUELLA] │  (ANTIOQUIA)                       │
+#  │  │          │  Lugar De NaciMiEnto                │
+#  │  │          │                                     │
+#  │  │          │  1.72       O+         M            │
+#  │  │          │  Estatuaa   Gs   aH    SEXO         │
+#  │  └──────────┘                                     │
+#  │              29-NOV-2001 CANASGORDAS              │
+#  │              Fecha  lugaade ExpediCion            │
+#  │              REGISTRADOR NACIONAL                 │
+#  │              ivan Duque Escodaa                   │
+#  │  ┌────────────────────────────────────────────┐  │
+#  │  │ P-0107600-14099842-M-0070435855-20020112   │  │
+#  │  │ 0559402012A 01              104059525      │  │
+#  │  └────────────────────────────────────────────┘  │
+#  └──────────────────────────────────────────────────┘
+
+REVERSO_ZONES: Dict[str, list] = {
+    # Fecha de nacimiento: arriba derecha (y 15-28%)
+    "fecha_nacimiento":   [0.12, 0.42, 0.30, 0.92],
+
+    # Lugar de nacimiento: debajo de fecha (y 22-40%)
+    "lugar_nacimiento":   [0.22, 0.42, 0.40, 0.92],
+
+    # Estatura: franja media, parte izquierda (y 35-50%, x 37-58%)
+    "estatura":            [0.35, 0.37, 0.50, 0.58],
+
+    # Grupo sanguíneo: franja media, centro (y 35-50%, x 55-73%)
+    "grupo_sanguineo":     [0.35, 0.53, 0.50, 0.73],
+
+    # Sexo: franja media, derecha (y 35-50%, x 70-92%)
+    "sexo":                [0.35, 0.68, 0.50, 0.92],
+
+    # Fecha y lugar de expedición: debajo de estatura/gs/sexo (y 48-65%)
+    "fecha_expedicion":    [0.46, 0.42, 0.66, 0.92],
+
+    # Código de barras PDF417: franja inferior (y 78-95%)
+    "codigo_barras":       [0.78, 0.02, 0.96, 0.98],
+}
+
+
+# ═══════════════════════════════════════════════════════════════
+# ZONAS DE LA CÉDULA DIGITAL NUEVA (formato horizontal/landscape)
+# ═══════════════════════════════════════════════════════════════
+# Las imágenes de la cédula digital nueva vienen en horizontal
+# (w > h). No necesitan rotación.
+#
+# Layout del ANVERSO en landscape (~1600x1000):
+#  ┌──────────────────────────────────────────────────────┐
+#  │              REPÚBLICA DE COLOMBIA                    │
+#  │                                                       │
+#  │  ┌────────────────┐    ┌──────────────────────────┐  │
+#  │  │                │    │  NUIP: 1.234.567.890     │  │
+#  │  │    [FOTO]      │    │                          │  │
+#  │  │                │    └──────────────────────────┘  │
+#  │  └────────────────┘                                   │
+#  │  APELLIDOS: Walteros                                 │
+#  │  NOMBRES: Laura                SEXO: F               │
+#  │  COL                                                  │
+#  │  FECHA NAC: 15 ABR 2004                              │
+#  │  LUGAR NAC: CARTAGENA (BOLIVAR)                      │
+#  │  EXPEDICION: 19 ABR 2027 CARTAGENA                   │
+#  └──────────────────────────────────────────────────────┘
+
+ANVERSO_ZONES_NUEVA: Dict[str, list] = {
+    # NUIP: arriba derecha (y=12-22%, x=65-95%)
+    "nuip_number":         [0.10, 0.60, 0.24, 0.97],
+
+    # Apellidos: izquierda, debajo de la foto (y=17-28%, x=35-60%)
+    "last_names":          [0.15, 0.35, 0.28, 0.62],
+
+    # Nombres: izquierda, debajo de apellidos (y=28-40%, x=35-60%)
+    "given_names":         [0.26, 0.35, 0.42, 0.62],
+
+    # Sexo: derecha central (y=38-52%, x=62-80%)
+    "sexo_nuevo":          [0.38, 0.62, 0.52, 0.82],
+
+    # País / Nacionalidad: izquierda central (y=43-52%, x=35-55%)
+    "pais_emisor":         [0.42, 0.33, 0.52, 0.55],
+
+    # Fecha de nacimiento: izquierda (y=48-62%, x=35-65%)
+    "birth_date":          [0.48, 0.35, 0.62, 0.65],
+
+    # Lugar de nacimiento: izquierda (y=58-75%, x=35-85%)
+    "birth_place":         [0.56, 0.35, 0.75, 0.85],
+
+    # Fecha y lugar de expedición: abajo (y=75-96%, x=35-85%)
+    "issue_info":          [0.73, 0.35, 0.96, 0.88],
+}
+
+# Layout del REVERSO en landscape (~1600x1000):
+#  ┌──────────────────────────────────────────────────────┐
+#  │                                                       │
+#  │                    ┌──────────┐                       │
+#  │                    │ [QR CODE]│                       │
+#  │                    └──────────┘                       │
+#  │                                                       │
+#  │  ════════════════════════════════════════════════════ │
+#  │  ════════ [MRZ LÍNEA 1] ═══════════════════════════ │
+#  │  ════════ [MRZ LÍNEA 2] ═══════════════════════════ │
+#  │  ════════ [MRZ LÍNEA 3] ═══════════════════════════ │
+#  └──────────────────────────────────────────────────────┘
+
+REVERSO_ZONES_NUEVA: Dict[str, list] = {
+    # Código QR: centro-derecha superior
+    "qr_code":             [0.05, 0.55, 0.45, 0.95],
+
+    # MRZ línea 1: franja inferior (y=66-73%)
+    "mrz_line_1":          [0.64, 0.02, 0.74, 0.98],
+
+    # MRZ línea 2: franja inferior (y=74-81%)
+    "mrz_line_2":          [0.73, 0.02, 0.82, 0.98],
+
+    # MRZ línea 3: franja inferior (y=82-90%)
+    "mrz_line_3":          [0.82, 0.02, 0.92, 0.98],
+}
+
+
+# ═══════════════════════════════════════════════════════════════
+# Filtros: textos que NO son datos del titular
+# ═══════════════════════════════════════════════════════════════
+_IGNORE_EXACT = {
+    "M", "F",  # sexo se maneja aparte, pero no queremos que caiga en otras zonas
+}
+
+_IGNORE_PATTERNS = [
+    re.compile(p, re.IGNORECASE) for p in [
+        r"^REPUBLICA\s*(DE\s*)?COLOMBI?A?$",
+        r"^CEDULA\s*(DE\s*)?CIUDADANIA$",
+        r"^CEDULA\s*(DE\s*)?EXTRANJERIA$",
+        r"^TARJETA\s*(DE\s*)?IDENTIDAD$",
+        r"^IDENTIFICACION\s*PERSONAL$",
+        r"^REGISTRADOR\s*NACIONAL$",
+        r"^REGISTRADURIA",
+        r"^FIRMA(\s*DEL\s*TITULAR)?$",
+        r"^HUELLA(\s*DACTILAR)?$",
+        r"^INDICE\s*DERECHO$",
+        r"^(FECHA|LUGAR)\s*(DE\s*)?(NACIMIENTO|EXPEDICION)$",
+        r"^(FECHA|LUGAR)\s*(Y|DE)\s*(NACIMIENTO|EXPEDICION)$",
+        r"^(ESTATU(A|RA)|ESTATUAA?)$",
+        r"^(G\.?S\.?|GRUPO\s*SANGUINEO|RH|AH?)$",
+        r"^SEXO$",
+        r"^NACIONALIDAD$",
+        r"^(NUMERO|NO\.?)\s*(DE\s*)?CEDULA$",
+        r"^(NOMBRES?|APELLIDOS?)$",
+        r"^(PRIMER|SEGUNDO)\s*APELLIDO$",
+        r"^IVAN\s*DUQUE",
+        r"^[A-Z]?\d{6,}[A-Z]\s*\d{2}$",  # código numérico auxiliar del PDF417 (ej: 0559402012A 01)
+    ]
 ]
 
 
 def _is_label(text: str) -> bool:
-    """
-    Detecta si un texto OCR es una etiqueta fija del formato de cédula.
-    Usa coincidencia exacta + coincidencia fuzzy por ratio de similitud.
-    """
-    t = text.upper().strip()
-    # Solo textos razonables (al menos 4 caracteres para ser label)
-    if len(t) < 4:
+    """Detecta si un texto es una etiqueta del formato (no es un dato)."""
+    t = text.strip()
+    # M y F son sexo válido, no son labels
+    if t.upper() in ("M", "F"):
         return False
-
-    for label in _LABELS:
-        if t == label:
+    if len(t) <= 1:
+        return True
+    if len(t) <= 3 and not any(c.isdigit() for c in t):
+        return True
+    for pat in _IGNORE_PATTERNS:
+        if pat.match(t):
             return True
-        # Calcular ratio de caracteres coincidentes
-        ratio = _similarity_ratio(t, label)
-        if ratio >= 0.75:
-            return True
-        # Un label contiene al otro (substring largo)
-        if len(t) >= 6 and len(label) >= 6:
-            if t in label or label in t:
-                return True
-
     return False
 
 
-def _similarity_ratio(a: str, b: str) -> float:
-    """
-    Ratio de similitud entre dos strings basado en la longitud de
-    la subsecuencia común más larga (LCS).
-    """
-    n, m = len(a), len(b)
-    if n == 0 and m == 0:
-        return 1.0
-    if n == 0 or m == 0:
-        return 0.0
-
-    # LCS via programación dinámica
-    dp = [[0] * (m + 1) for _ in range(n + 1)]
-    for i in range(n):
-        for j in range(m):
-            if a[i] == b[j]:
-                dp[i + 1][j + 1] = dp[i][j] + 1
-            else:
-                dp[i + 1][j + 1] = max(dp[i][j + 1], dp[i + 1][j])
-
-    lcs = dp[n][m]
-    return (2.0 * lcs) / (n + m)  # Dice coefficient
-
-
-@dataclass
-class TextBlock:
-    text: str
-    conf: float
-    x: int
-    y: int
-    w: int
-    h: int
+def _point_in_zone(cx: float, cy: float, zone: list) -> bool:
+    """Verifica si un punto (cx, cy en 0..1) cae dentro de una zona."""
+    ymin, xmin, ymax, xmax = zone
+    return xmin <= cx <= xmax and ymin <= cy <= ymax
 
 
 def classify_blocks(
@@ -90,36 +234,9 @@ def classify_blocks(
     img_h: int,
 ) -> Dict[str, str]:
     """
-    Clasifica bloques OCR en campos de cédula según su posición.
-
-    Layout conocido de la cédula colombiana (anverso):
-    ┌──────────────────────────────────────────────┐
-    │  REPUBLICA DE COLOMBIA                       │
-    │  IDENTIFICACION PERSONAL                     │
-    │                                              │
-    │  ┌──────┐   CEDULA DE CIUDADANIA             │
-    │  │ FOTO │   1.234.567.890    <- número        │
-    │  │      │                                    │
-    │  │      │   APELLIDOS                        │
-    │  │      │   NOMBRES                          │
-    │  │      │                                    │
-    │  └──────┘   FECHA DE NACIMIENTO              │
-    │             LUGAR DE NACIMIENTO              │
-    │             ESTATURA    G.S.   SEXO          │
-    │             FECHA DE EXPEDICION              │
-    │                                              │
-    │  ┌──────────────────────────────────┐        │
-    │  │ FIRMA                            │        │
-    │  └──────────────────────────────────┘        │
-    │                                              │
-    │  ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓     │
-    │  ▓▓▓▓  PDF417 (código de barras)   ▓▓▓▓     │
-    └──────────────────────────────────────────────┘
-
-    La foto está a la izquierda (~0-35% del ancho).
-    Los datos están a la derecha (~35-100% del ancho).
+    Clasifica bloques OCR del ANVERSO usando zonas proporcionales exactas.
     """
-    result = {
+    result: Dict[str, str] = {
         "numero_cedula": "",
         "apellidos_nombres": "",
         "fecha_nacimiento": "",
@@ -133,125 +250,36 @@ def classify_blocks(
     if img_w <= 0 or img_h <= 0:
         return result
 
-    # Filtrar bloques con confianza muy baja
-    good_blocks = [b for b in blocks if b["conf"] >= 0.15]
+    # Filtrar ruido y labels
+    good = [b for b in blocks if b["conf"] >= 0.10 and not _is_label(b["text"])]
 
-    # Ordenar por posición Y (de arriba a abajo) para respetar orden natural
-    good_blocks.sort(key=lambda b: (b["y"], b["x"]))
+    # Agrupar por zona
+    zone_texts: Dict[str, list] = {k: [] for k in ANVERSO_ZONES}
 
-    # Separar bloques en lado izquierdo (foto/labels) y centro (datos reales)
-    left_blocks = []
-    center_blocks = []
-    right_noise = []
-    for b in good_blocks:
-        x_pct = b["x"] / img_w
-        if x_pct < 0.06:
-            left_blocks.append(b)
-        elif x_pct > 0.40:
-            right_noise.append(b)
-        else:
-            center_blocks.append(b)
+    for b in good:
+        cx = (b["x"] + b["w"] / 2) / img_w
+        cy = (b["y"] + b["h"] / 2) / img_h
 
-    # Clasificar: procesar primero los bloques del centro (los datos reales)
-    for b in center_blocks + left_blocks:
-        text = b["text"].strip()
-        y_pct = b["y"] / img_h
-        x_pct = b["x"] / img_w
+        for campo, zone in ANVERSO_ZONES.items():
+            if _point_in_zone(cx, cy, zone):
+                zone_texts[campo].append((b["text"], b["y"]))
 
-        # Filtrar etiquetas conocidas (con fuzzy match para variantes OCR)
-        text_upper = text.upper()
-        if _is_label(text_upper):
-            continue
+    # ── Número de cédula ──
+    if zone_texts["numero_cedula"]:
+        # Preferir el texto con más dígitos
+        texts = [t for t, _ in zone_texts["numero_cedula"]]
+        best = max(texts, key=lambda t: sum(1 for c in t if c.isdigit()))
+        result["numero_cedula"] = best
 
-        # Número de cédula: arriba, contiene muchos dígitos (>=5)
-        digit_count = sum(1 for c in text if c.isdigit())
-        if digit_count >= 5 and y_pct < 0.50:
-            result["numero_cedula"] += " " + text
-
-        # Apellidos y nombres: franja media-superior
-        elif 0.10 <= y_pct <= 0.65 and x_pct < 0.40 and digit_count < 3:
-            # Si ya hay apellidos, agregar a nombres
-            if result["apellidos_nombres"]:
-                result["apellidos_nombres"] += " " + text
-            else:
-                result["apellidos_nombres"] = text
-
-        # Fecha de nacimiento: números en franja media
-        elif 0.35 <= y_pct <= 0.55 and digit_count >= 2:
-            result["fecha_nacimiento"] += " " + text
-
-        # Lugar de nacimiento: franja media
-        elif 0.45 <= y_pct <= 0.65 and x_pct >= 0.20 and digit_count < 3:
-            result["lugar_nacimiento"] += " " + text
-
-        # Estatura + G.S. + Sexo: franja media-baja
-        elif 0.40 <= y_pct <= 0.65 and x_pct >= 0.40:
-            if x_pct < 0.52:
-                result["estatura"] += " " + text
-            elif x_pct < 0.62:
-                result["grupo_sanguineo"] += " " + text
-            else:
-                result["sexo"] += " " + text
-
-        # Fecha de expedición: franja baja
-        elif 0.55 <= y_pct <= 0.75 and x_pct >= 0.25 and digit_count >= 2:
-            result["fecha_expedicion"] += " " + text
-
-    # Post-procesar: correcciones OCR comunes
-    _OCR_FIXES = {
-        "HUIZ": "RUIZ",
-        "COLOMBLA": "COLOMBIA",
-        "PEPUBLICA": "REPUBLICA",
-    }
-    for key in result:
-        if result[key]:
-            for bad, good in _OCR_FIXES.items():
-                result[key] = result[key].replace(bad, good)
-
-    # Limpiar espacios extra
-    for key in result:
-        result[key] = " ".join(result[key].split())
+    # ── Apellidos + Nombres ──
+    # Ordenar por Y (de arriba a abajo): apellidos primero, luego nombres
+    apellidos_texts = [t for t, _ in sorted(zone_texts["apellidos"], key=lambda x: x[1])]
+    nombres_texts = [t for t, _ in sorted(zone_texts["nombres"], key=lambda x: x[1])]
+    combined = apellidos_texts + nombres_texts
+    if combined:
+        result["apellidos_nombres"] = " ".join(combined)
 
     return result
-
-
-# ── Labels específicas del reverso ──────────────────────────
-# Formato: label -> campo. Se emparejan contra el texto OCR.
-_REVERSO_LABEL_MAP = {
-    "FECHA DE NACIMIENTO": "fecha_nacimiento",
-    "FECHA NACIMIENTO": "fecha_nacimiento",
-    "LUGAR DE NACIMIENTO": "lugar_nacimiento",
-    "ESTATURA": "estatura",
-    "G.S.": "grupo_sanguineo",
-    "GS": "grupo_sanguineo",
-    "GRUPO SANGUINEO": "grupo_sanguineo",
-    "SEXO": "sexo",
-    "FECHA DE EXPEDICION": "fecha_expedicion",
-    "FECHA EXPEDICION": "fecha_expedicion",
-}
-
-
-def _match_reverso_label(text: str) -> Optional[str]:
-    """Devuelve el campo al que pertenece un label del reverso, o None.
-    Solo acepta coincidencias de alta confianza (ratio >= 0.85) para
-    evitar falsos positivos con valores como 'Estatuaa' -> ESTATURA."""
-    t = text.upper().strip()
-
-    # Si el texto es corto (<6 chars), exigir coincidencia exacta
-    if len(t) < 6:
-        for label, campo in _REVERSO_LABEL_MAP.items():
-            if t == label:
-                return campo
-        return None
-
-    # Textos largos: fuzzy matching con umbral alto
-    for label, campo in _REVERSO_LABEL_MAP.items():
-        if t == label:
-            return campo
-        if len(label) >= 6 and _similarity_ratio(t, label) >= 0.85:
-            return campo
-
-    return None
 
 
 def classify_blocks_reverso(
@@ -260,36 +288,9 @@ def classify_blocks_reverso(
     img_h: int,
 ) -> Dict[str, str]:
     """
-    Clasifica bloques OCR del REVERSO de la cédula colombiana.
-
-    Layout real (cc_reverso.jpg 1600x1200):
-    ┌────────────────────────────────────────────────┐
-    │  0-20%        35-55%          55-100%          │
-    │              ┌──────────────┬─────────────────┤
-    │              │ FECHA DE NAC │ 27-NOV-1983     │  y 18-28%
-    │              │              │ CAÑASGORDAS     │  y 22-32%
-    │              │              │ (ANTIOQUIA)     │  y 27-32%
-    │              │ Lugar...     │                 │  y 30-35%
-    │              ├──────────────┼──────┬──────────┤
-    │              │              │      │          │
-    │              │ 1.72         │ O+   │ M        │  y 35-42%
-    │              │ Estatuaa     │ Gs   │ SEXO     │  y 42-46%
-    │              ├──────────────┴──────┴──────────┤
-    │              │ 29-NOV-2001 CANASGORDAS         │  y 46-52%
-    │              │ Fecha   lugaade ExpediCion      │  y 52-56%
-    │              ├─────────────────────────────────┤
-    │              │ REGISTRADOR NACIONAL            │  y 56-60%
-    │ indice Der.  │ ivan Duque Escodaa              │
-    │              ├─────────────────────────────────┤
-    │              │ ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓ │
-    │              │ P-0107600-14099842-...          │  y 82-90%
-    │              │ 0559402012A 01   104059525      │
-    └────────────────────────────────────────────────┘
-
-    Estrategia: filtrar labels conocidos, usar solo valores reales,
-    clasificar por franjas Y específicas del reverso.
+    Clasifica bloques OCR del REVERSO usando zonas proporcionales exactas.
     """
-    result = {
+    result: Dict[str, str] = {
         "numero_cedula": "",
         "apellidos_nombres": "",
         "fecha_nacimiento": "",
@@ -303,113 +304,314 @@ def classify_blocks_reverso(
     if img_w <= 0 or img_h <= 0:
         return result
 
-    # Filtrar labels y headers para quedarnos solo con valores
-    values = []
-    for b in blocks:
-        text = b["text"].strip()
-        if b["conf"] < 0.05:
-            continue
-        if _is_reverso_junk(text):
-            continue
-        values.append({"text": text, "x": b["x"], "y": b["y"], "w": b["w"], "h": b["h"], "conf": b["conf"]})
+    # Filtrar ruido y labels
+    good = [b for b in blocks if b["conf"] >= 0.05 and not _is_label(b["text"])]
 
-    if not values:
-        return result
+    # Agrupar por zona
+    zone_texts: Dict[str, list] = {k: [] for k in REVERSO_ZONES}
 
-    # ── Clasificar por franjas Y ──────────────────────────
-    for b in values:
-        text = b["text"]
-        y_pct = b["y"] / img_h
-        x_pct = b["x"] / img_w
-        digit_count = sum(1 for c in text if c.isdigit())
+    for b in good:
+        cx = (b["x"] + b["w"] / 2) / img_w
+        cy = (b["y"] + b["h"] / 2) / img_h
 
-        # ── Fecha de nacimiento: y 18-28%, con muchos dígitos ──
-        if 0.18 <= y_pct <= 0.28 and digit_count >= 4:
-            result["fecha_nacimiento"] += " " + text
+        for campo, zone in REVERSO_ZONES.items():
+            if _point_in_zone(cx, cy, zone):
+                zone_texts[campo].append(b["text"])
 
-        # ── Lugar de nacimiento: y 22-35%, texto sin números ──
-        elif 0.22 <= y_pct <= 0.35 and digit_count == 0 and x_pct > 0.30:
-            result["lugar_nacimiento"] += " " + text
+    # ── Fecha de nacimiento ──
+    for t in zone_texts["fecha_nacimiento"]:
+        m = re.search(r"(\d{1,2}[-/][A-Z]{3}[-/]\d{4})", t, re.IGNORECASE)
+        if m:
+            result["fecha_nacimiento"] = m.group(1)
+            break
+    if not result["fecha_nacimiento"] and zone_texts["fecha_nacimiento"]:
+        for t in zone_texts["fecha_nacimiento"]:
+            if sum(1 for c in t if c.isdigit()) >= 4:
+                result["fecha_nacimiento"] = t
+                break
 
-        # ── Estatura: y 35-42%, patrón N.NN, izquierda ──
-        elif 0.35 <= y_pct <= 0.42 and x_pct < 0.48:
-            import re
-            if re.match(r'^\d\.\d{2}$', text):
-                result["estatura"] = text
+    # ── Lugar de nacimiento ──
+    for t in zone_texts["lugar_nacimiento"]:
+        cleaned = re.sub(r"[()]", "", t).strip()
+        if sum(1 for c in cleaned if c.isdigit()) == 0 and len(cleaned) >= 3:
+            if result["lugar_nacimiento"]:
+                result["lugar_nacimiento"] += " " + t
+            else:
+                result["lugar_nacimiento"] = t
 
-        # ── Grupo sanguíneo: y 35-42%, centro ──
-        elif 0.35 <= y_pct <= 0.42 and 0.48 <= x_pct <= 0.65:
-            import re
-            cleaned = text.upper().replace(" ", "").replace("0", "O")
-            if re.match(r'^[ABO][+-]$', cleaned):
-                result["grupo_sanguineo"] = cleaned
+    # ── Estatura ──
+    for t in zone_texts["estatura"]:
+        m = re.search(r"\d\.\d{2}", t)
+        if m:
+            result["estatura"] = m.group(0)
+            break
 
-        # ── Sexo: y 35-42%, derecha ──
-        elif 0.35 <= y_pct <= 0.42 and x_pct > 0.65:
-            t = text.upper().strip()
-            if t in ("M", "F"):
-                result["sexo"] = t
+    # ── Grupo sanguíneo ──
+    for t in zone_texts["grupo_sanguineo"]:
+        cleaned = t.upper().replace(" ", "").replace("0", "O")
+        m = re.search(r"[ABO][+-]", cleaned)
+        if m:
+            result["grupo_sanguineo"] = m.group(0)
+            break
 
-        # ── Fecha de expedición: y 46-55%, con dígitos ──
-        elif 0.46 <= y_pct <= 0.55 and digit_count >= 4:
-            result["fecha_expedicion"] += " " + text
+    # ── Sexo ──
+    for t in zone_texts["sexo"]:
+        tt = t.upper().strip()
+        if tt in ("M", "F"):
+            result["sexo"] = tt
+            break
 
-    # ── Limpiar ─────────────────────────────────────────
+    # ── Fecha de expedición ──
+    for t in zone_texts["fecha_expedicion"]:
+        m = re.search(r"(\d{1,2}[-/][A-Z]{3}[-/]\d{4})", t, re.IGNORECASE)
+        if m:
+            result["fecha_expedicion"] = m.group(1)
+            break
+    if not result["fecha_expedicion"] and zone_texts["fecha_expedicion"]:
+        for t in zone_texts["fecha_expedicion"]:
+            if sum(1 for c in t if c.isdigit()) >= 4:
+                result["fecha_expedicion"] = t
+                break
+
+    # ── Limpiar espacios ──
     for key in result:
         if result[key]:
-            result[key] = " ".join(result[key].split()).strip()
-
-    # ── Correcciones ────────────────────────────────────
-    # Si fecha_expedicion incluye texto sin dígitos, limpiar
-    if result["fecha_expedicion"]:
-        import re
-        m = re.search(r'\d{1,2}[\s-]*[A-Z]{3}[\s-]*\d{4}', result["fecha_expedicion"])
-        if m:
-            result["fecha_expedicion"] = m.group(0)
-
-    # Si fecha_nacimiento tiene texto extra (ej: "CAÑASGORDAS"), mover a lugar
-    if result["fecha_nacimiento"]:
-        import re
-        parts = result["fecha_nacimiento"].split()
-        date_parts = []
-        lugar_parts = []
-        for p in parts:
-            if re.match(r'\d{1,2}$', p) or re.match(r'^[A-Z]{3}$', p) or re.match(r'^\d{4}$', p) or re.match(r'\d{1,2}-[A-Z]{3}-\d{4}', p):
-                date_parts.append(p)
-            else:
-                lugar_parts.append(p)
-        if date_parts:
-            result["fecha_nacimiento"] = " ".join(date_parts)
-        if lugar_parts:
-            result["lugar_nacimiento"] = " ".join(lugar_parts) + " " + result["lugar_nacimiento"]
-            result["lugar_nacimiento"] = result["lugar_nacimiento"].strip()
+            result[key] = " ".join(result[key].split())
 
     return result
 
 
+# ═══════════════════════════════════════════════════════════════
+# Clasificación para CÉDULA DIGITAL NUEVA (formato azul)
+# ═══════════════════════════════════════════════════════════════
+
+def classify_blocks_nueva(
+    blocks: List[dict],
+    img_w: int,
+    img_h: int,
+) -> Dict[str, str]:
+    """
+    Clasifica bloques OCR del ANVERSO de la cédula digital nueva.
+    """
+    result: Dict[str, str] = {
+        "numero_cedula": "",
+        "apellidos_nombres": "",
+        "fecha_nacimiento": "",
+        "lugar_nacimiento": "",
+        "estatura": "",
+        "grupo_sanguineo": "",
+        "sexo": "",
+        "fecha_expedicion": "",
+    }
+
+    if img_w <= 0 or img_h <= 0:
+        return result
+
+    good = [b for b in blocks if b["conf"] >= 0.10 and not _is_label(b["text"])]
+
+    zone_texts: Dict[str, list] = {k: [] for k in ANVERSO_ZONES_NUEVA}
+
+    for b in good:
+        cx = (b["x"] + b["w"] / 2) / img_w
+        cy = (b["y"] + b["h"] / 2) / img_h
+
+        for campo, zone in ANVERSO_ZONES_NUEVA.items():
+            if _point_in_zone(cx, cy, zone):
+                zone_texts[campo].append((b["text"], b["y"]))
+
+    # ── NUIP / Número de cédula ──
+    if zone_texts["nuip_number"]:
+        texts = [t for t, _ in zone_texts["nuip_number"]]
+        best = max(texts, key=lambda t: sum(1 for c in t if c.isdigit()))
+        # Limpiar: quitar prefijos no numéricos, conservar dígitos y puntos
+        cleaned = re.sub(r"[^0-9.]", "", best)
+        # Si queda algo como 1.234.567.890, eliminar puntos para dejar solo dígitos
+        result["numero_cedula"] = cleaned.replace(".", "") if len(cleaned) >= 6 else cleaned
+
+    # ── Apellidos + Nombres ──
+    apellidos = [t for t, _ in sorted(zone_texts["last_names"], key=lambda x: x[1])]
+    nombres = [t for t, _ in sorted(zone_texts["given_names"], key=lambda x: x[1])]
+    combined = apellidos + nombres
+    if combined:
+        result["apellidos_nombres"] = " ".join(combined)
+
+    # ── Fecha de nacimiento ──
+    for t, _ in zone_texts["birth_date"]:
+        m = re.search(r"(\d{1,2}[-/][A-Z]{3}[-/]\d{4})", t, re.IGNORECASE)
+        if m:
+            result["fecha_nacimiento"] = m.group(1)
+            break
+    if not result["fecha_nacimiento"] and zone_texts["birth_date"]:
+        for t, _ in zone_texts["birth_date"]:
+            # También acepta formato DD/MM/AAAA
+            m = re.search(r"(\d{1,2}[-/]\d{1,2}[-/]\d{4})", t)
+            if m:
+                result["fecha_nacimiento"] = m.group(1)
+                break
+    if not result["fecha_nacimiento"] and zone_texts["birth_date"]:
+        for t, _ in zone_texts["birth_date"]:
+            if sum(1 for c in t if c.isdigit()) >= 4:
+                result["fecha_nacimiento"] = t
+                break
+
+    # ── Lugar de nacimiento ──
+    for t, _ in zone_texts["birth_place"]:
+        cleaned = re.sub(r"[()]", "", t).strip()
+        if len(cleaned) >= 3:
+            if result["lugar_nacimiento"]:
+                result["lugar_nacimiento"] += " " + t
+            else:
+                result["lugar_nacimiento"] = t
+
+    # ── Fecha de expedición ──
+    for t, _ in zone_texts["issue_info"]:
+        # Puede contener fecha + lugar
+        m = re.search(r"(\d{1,2}[-/][A-Z]{3}[-/]\d{4})", t, re.IGNORECASE)
+        if m:
+            result["fecha_expedicion"] = m.group(1)
+            break
+        m = re.search(r"(\d{1,2}[-/]\d{1,2}[-/]\d{4})", t)
+        if m:
+            result["fecha_expedicion"] = m.group(1)
+            break
+    if not result["fecha_expedicion"] and zone_texts["issue_info"]:
+        for t, _ in zone_texts["issue_info"]:
+            if sum(1 for c in t if c.isdigit()) >= 4:
+                result["fecha_expedicion"] = t
+                break
+
+    # ── Limpiar espacios ──
+    for key in result:
+        if result[key]:
+            result[key] = " ".join(result[key].split())
+
+    # ── Sexo (zona dedicada en el anverso nuevo) ──
+    for t, _ in zone_texts.get("sexo_nuevo", []):
+        tt = t.upper().strip().rstrip(".")
+        if tt in ("M", "F", "MAS", "MASC", "MASCULINO", "FEM", "FEMENINO"):
+            result["sexo"] = "M" if tt.startswith("M") else "F"
+            break
+
+    return result
+
+
+def classify_blocks_reverso_nueva(
+    blocks: List[dict],
+    img_w: int,
+    img_h: int,
+) -> Dict[str, str]:
+    """
+    Clasifica bloques OCR del REVERSO de la cédula digital nueva.
+
+    Extrae principalmente las líneas MRZ (Machine Readable Zone),
+    que contienen todos los datos del titular codificados.
+    """
+    result: Dict[str, str] = {
+        "numero_cedula": "",
+        "apellidos_nombres": "",
+        "fecha_nacimiento": "",
+        "lugar_nacimiento": "",
+        "estatura": "",
+        "grupo_sanguineo": "",
+        "sexo": "",
+        "fecha_expedicion": "",
+        "mrz_raw": "",
+    }
+
+    if img_w <= 0 or img_h <= 0:
+        return result
+
+    good = [b for b in blocks if b["conf"] >= 0.05 and not _is_label(b["text"])]
+
+    zone_texts: Dict[str, list] = {k: [] for k in REVERSO_ZONES_NUEVA}
+
+    for b in good:
+        cx = (b["x"] + b["w"] / 2) / img_w
+        cy = (b["y"] + b["h"] / 2) / img_h
+
+        for campo, zone in REVERSO_ZONES_NUEVA.items():
+            if _point_in_zone(cx, cy, zone):
+                zone_texts[campo].append(b["text"])
+
+    # ── Concatenar líneas MRZ ──
+    mrz_lines = []
+    for key in ("mrz_line_1", "mrz_line_2", "mrz_line_3"):
+        for t in zone_texts[key]:
+            # Limpiar: solo letras, dígitos y <
+            cleaned = re.sub(r"[^A-Z0-9<]", "", t.upper())
+            if len(cleaned) >= 10:
+                mrz_lines.append(cleaned)
+    if mrz_lines:
+        result["mrz_raw"] = "\n".join(mrz_lines)
+
+    return result
+
+
+def detect_format(blocks: List[dict], img_w: int, img_h: int,
+                  es_reverso: bool = False) -> str:
+    """
+    Detecta si la imagen corresponde a la cedula antigua o la nueva digital.
+
+    Estrategia:
+    1. MRZ: si hay 2+ lineas con '<' en el tercio inferior → 'nueva' (definitivo)
+    2. Si es_reverso=True y NO hay MRZ → 'clasica' (reverso clasico no tiene MRZ)
+    3. Votacion SOLO con zonas de anverso de ambos formatos + labels
+
+    Returns:
+        'nueva' o 'clasica'
+    """
+    if img_w <= 0 or img_h <= 0:
+        return "clasica"
+
+    # ── 1. MRZ (exclusivo de la digital nueva, 100% confiable) ──
+    mrz_candidates = 0
+    for b in blocks:
+        t = b["text"].strip().upper()
+        cy = (b["y"] + b["h"] / 2) / img_h
+        bw = b["w"] / img_w
+        if cy > 0.60 and bw > 0.60 and t.count("<") >= 5 and len(t) >= 20:
+            mrz_candidates += 1
+    if mrz_candidates >= 2:
+        return "nueva"
+
+    # ── 2. Reverso sin MRZ → clasica ──
+    if es_reverso:
+        return "clasica"
+
+    # ── 3. Votacion solo con anversos (sin REVERSO_ZONES que solapan) ──
+    score_nueva = 0.0
+    score_clasica = 0.0
+
+    for b in blocks:
+        if b["conf"] < 0.10:
+            continue
+        cx = (b["x"] + b["w"] / 2) / img_w
+        cy = (b["y"] + b["h"] / 2) / img_h
+
+        for zone in ANVERSO_ZONES_NUEVA.values():
+            if _point_in_zone(cx, cy, zone):
+                score_nueva += 1.0
+                break
+        for zone in ANVERSO_ZONES.values():
+            if _point_in_zone(cx, cy, zone):
+                score_clasica += 2.0
+                break
+
+    # ── 4. Labels caracteristicos ──
+    for b in blocks:
+        t = b["text"].strip().upper()
+        if t in ("NUIP", "NUIP:"):
+            score_nueva += 5.0
+        if "CEDULA DE CIUDADANIA" in t or "CEDULA DE EXTRANJERIA" in t:
+            score_clasica += 5.0
+
+    return "nueva" if score_nueva > score_clasica else "clasica"
+
+
+# ── Compatibilidad con código que referencia estas funciones ──
 def _is_reverso_junk(text: str) -> bool:
-    """Detecta si un texto es una etiqueta/header del reverso (no es un dato)."""
-    t = text.upper().strip()
-    # Datos válidos de 1 caracter: M, F
-    if t in ("M", "F"):
-        return False
-    if len(t) < 2:
-        return True
-    # Labels conocidos
-    if t in ("FECHA DE NACIMIENTO", "FECHA NACIMIENTO", "LUGAR DE NACIMIENTO",
-             "ESTATURA", "G.S.", "GS", "GRUPO SANGUINEO",
-             "SEXO", "FECHA DE EXPEDICION", "FECHA EXPEDICION",
-             "REGISTRADOR NACIONAL", "INDICE DERECHO", "IVAN DUQUE ESCODAA",
-             "CEDULA DE CIUDADANIA"):
-        return True
-    # Fuzzy match para labels
-    if _similarity_ratio(t, "REPUBLICA DE COLOMBIA") >= 0.70:
-        return True
-    if _similarity_ratio(t, "REGISTRADOR NACIONAL") >= 0.80:
-        return True
-    if _match_reverso_label(t):
-        return True
-    # Textos muy cortos que son ruido
-    if len(t) <= 3 and not any(c.isdigit() for c in t) and t not in ("M", "F"):
-        return True
-    return False
+    return _is_label(text)
+
+
+def _match_reverso_label(text: str) -> Optional[str]:
+    return None
